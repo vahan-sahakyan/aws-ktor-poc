@@ -114,12 +114,15 @@ bash bootstrap-k3s.sh
 5. **Envoy Gateway v1.9.2**, which also brings Gateway API v1.6.1 CRDs: `kubectl apply --server-side -f https://github.com/envoyproxy/gateway/releases/download/v1.9.2/install.yaml`. Then the controller is shrunk from its default 256Mi request to 48Mi/256Mi.
 6. **Self-signed TLS** for the public IP (SAN `IP:<public-ip>`), stored as Secret `ktor-poc/ktor-poc-tls`.
 
-Optional `kubectl` from your laptop (port 6443 stays closed in the security group):
+Optional `kubectl` from your laptop (port 6443 stays closed in the security group, so it goes through an SSH tunnel on local port 16443):
 
 ```bash
-scp -i infra/ktor-poc.pem ec2-user@$IP:/etc/rancher/k3s/k3s.yaml ~/.kube/ktor-poc.yaml
-ssh -i infra/ktor-poc.pem -N -L 6443:127.0.0.1:6443 ec2-user@$IP &
-KUBECONFIG=~/.kube/ktor-poc.yaml kubectl get nodes
+ssh -i infra/ktor-poc.pem ec2-user@$IP cat /etc/rancher/k3s/k3s.yaml \
+  | sed -E 's#127.0.0.1:6443#127.0.0.1:16443#; s#: default$#: ktor-poc#' > ~/.kube/ktor-poc.yaml
+cp ~/.kube/config ~/.kube/config.bak
+KUBECONFIG=~/.kube/config:~/.kube/ktor-poc.yaml kubectl config view --flatten > /tmp/kc && mv /tmp/kc ~/.kube/config
+ssh -i infra/ktor-poc.pem -N -L 16443:127.0.0.1:6443 ec2-user@$IP &   # keep running while you use kubectl
+kubectx ktor-poc && kubectl get nodes
 ```
 
 ## Phase 4 - Deploy
