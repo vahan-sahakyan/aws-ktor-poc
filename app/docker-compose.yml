@@ -1,0 +1,23 @@
+# local smoke test of the app + postgres before touching AWS
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: ktor
+      POSTGRES_USER: ktor
+      POSTGRES_PASSWORD: ktor
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ktor -d ktor"]
+      interval: 2s
+      retries: 30
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/ktor
+      DB_USER: ktor
+      DB_PASSWORD: ktor
+    depends_on:
+      postgres:
+        condition: service_healthy

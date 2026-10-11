@@ -1,0 +1,6 @@
+.gradle
+.kotlin
+build
+**/build
+*.md
+docker-compose.yml

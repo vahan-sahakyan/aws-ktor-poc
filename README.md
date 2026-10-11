@@ -1,0 +1,292 @@
+# ktor-poc: Ktor + Postgres on single-node K3s, one t3.micro
+
+A Kotlin Ktor service (REST + long-lived WebSockets + PostgreSQL) on a one-node K3s cluster, collapsed onto a single EC2 `t3.micro` in `us-east-1`. Traffic hits the instance's public IP directly: Envoy Gateway runs with `hostNetwork: true` and binds ports 80/443 on the host. There is no ALB/NLB, no NAT gateway, no Elastic IP and no container registry.
+
+```
+internet
+   |  :22 ssh   :80 http/ws   :443 https/wss
+   v
+[ security group ] -> [ EC2 t3.micro, AL2023, 30 GB gp3, 4 GB swapfile ]
+                        |
+                        +-- k3s (single node, control plane + workloads)
+                             |
+                             +-- envoy proxy  (hostNetwork, binds host :80/:443)
+                             |      |  HTTPRoute  /ws -> ktor (no route timeout)
+                             |      |             /   -> ktor
+                             |      v
+                             +-- ktor        (Deployment, ClusterIP :80 -> :8080, 512Mi)
+                             |      | jdbc (HikariCP, pool of 5)
+                             |      v
+                             +-- postgres 18 (Deployment, ClusterIP :5432, 256Mi,
+                                              hostPath /var/lib/ktor-poc/postgres)
+```
+
+```
+app/                    Ktor service, Dockerfile, docker-compose for local runs
+infra/                  Terraform (main.tf) + user_data.sh
+scripts/bootstrap-k3s.sh  Phase 3, runs on the node
+scripts/deploy.sh         Phase 4, runs on your laptop
+k8s/k8s-manifests.yaml  everything that runs in the cluster
+```
+
+## Cost model (read this first)
+
+This account is on the **AWS Free plan** (accounts created on or after 2025-07-15). That plan has no 750-hour allowance. Instead, free-tier-eligible usage is **paid from $100-200 of credits**, and the account closes after **6 months or when the credits run out**, whichever comes first, unless you upgrade. So "$0" here means **no card charges while the credits last**. It does not mean the usage is free forever.
+
+What this stack consumes, all of it free-tier eligible and paid from credits:
+
+| Item | Notes |
+|---|---|
+| 1x t3.micro, 24/7 | ~730 h/month. `cpu_credits = "standard"` is set, so the instance is **throttled, not billed**, when it runs out of CPU credits. T3 defaults to `unlimited`, which bills surplus CPU. |
+| 30 GB gp3 root volume | encrypted, deleted with the instance |
+| 1 public IPv4 | billed per hour like every public IPv4. Auto-assigned, deliberately **no Elastic IP**, because an EIP keeps billing while the instance is stopped. |
+| Data transfer out | negligible for a PoC |
+| VPC, subnet, IGW, route table, security group, key pair | free |
+| AWS Budget `ktor-poc-zero-spend` | free. Emails you on the **first cent of actual spend** after credits, and when the month's forecast exceeds $1. |
+
+Deliberately absent, because each one bills hourly: ALB/NLB (Envoy binds the host ports, and the Envoy Service is `ClusterIP`), NAT gateway, Elastic IP, ECR (the image is side-loaded over SSH), EBS snapshots, and detailed CloudWatch monitoring.
+
+## Memory budget on 1 GB
+
+| Component | Request | Limit | Measured (local 1 GiB rehearsal) |
+|---|---|---|---|
+| k3s server (apiserver, kine/sqlite, kubelet, containerd) | - | - | ~350-400 MiB |
+| envoy-gateway controller | 48Mi | 256Mi | ~85 MiB |
+| envoy proxy + shutdown-manager | 32Mi + 16Mi | 128Mi + 32Mi | ~60 MiB |
+| coredns | 70Mi | 170Mi | ~40 MiB |
+| postgres 18 | 64Mi | 256Mi | ~60 MiB |
+| ktor (JVM) | 128Mi | 512Mi | ~105 MiB |
+| **total** | ~360Mi | | **~740 MiB** |
+
+On the real instance, add ~150-200 MiB for Amazon Linux itself, which puts the total above physical RAM. The 4 GB swapfile absorbs the overflow:
+
+- **Host-level swap** (`user_data.sh`): the kernel pages cold memory from k3s and the OS out to disk.
+- **Pod-level swap** (kubelet `LimitedSwap` + Burstable pods): without this, the kubelet keeps every pod off swap (`NoSwap`). With it, each Burstable pod (requests < limits) may swap in proportion to its memory **request**: `swap = request / node RAM * swap size`. So the Ktor pod (128Mi request) can swap ~0.5 GB on top of its 512Mi RAM limit, and Postgres ~0.25 GB.
+- **JVM sizing**: `-Xmx320m` plus caps on metaspace (96m), code cache (32m), direct memory (32m) and thread stacks (512k) keep the whole process under the 512Mi limit. The brief's `-Xmx384m` would overshoot once off-heap memory is counted. `-XX:TieredStopAtLevel=1` trades peak throughput for less JIT memory and CPU. `-XX:+ExitOnOutOfMemoryError` lets Kubernetes restart a broken JVM.
+- **Eviction**: kubelet `evictionHard: memory.available<50Mi` (default 100Mi), so pods aren't evicted while swap is still absorbing pressure.
+
+If the box thrashes (constant `si`/`so` in `vmstat`), set `instance_type = "t3.small"` (2 GB). It is also on the Free plan, but burns credits about twice as fast.
+
+---
+
+## Prerequisites
+
+- AWS credentials for the Free-plan account (`aws sts get-caller-identity` works)
+- Terraform >= 1.9, Docker (with buildx), an SSH client
+- Optional, for testing WebSockets: [`websocat`](https://github.com/vi/websocat) (`brew install websocat`)
+
+## Phase 1 - Local application
+
+[`app/src/main/kotlin/com/example/Application.kt`](app/src/main/kotlin/com/example/Application.kt) is a single-file Ktor 3.6 service on Netty:
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /` | service info |
+| `GET /health` | liveness, no DB access |
+| `GET /ready` | readiness, validates a pooled DB connection |
+| `GET /api/notes`, `POST /api/notes` `{"text": "..."}` | REST over JDBC (`Dispatchers.IO`) |
+| `WS /ws/echo` | echoes each text frame |
+| `WS /ws/chat` | broadcasts every message to all connected sessions (`MutableSharedFlow`) |
+
+- WebSockets: server pings every 15s, closes after 30s without a pong, 64 KiB max frame.
+- HikariCP: pool of 5 (Postgres `max_connections=20`), 5s connection timeout, `initializationFailTimeout=-1`, so the app boots even before Postgres is up. The schema is created by a background retry loop with exponential backoff. The pool is closed on `ApplicationStopped`.
+- Config comes from env vars: `PORT` (8080), `DB_URL`, `DB_USER`, `DB_PASSWORD`.
+
+[`app/Dockerfile`](app/Dockerfile) is a multi-stage build: `gradle:9.8.1-jdk21-alpine` builds the fat jar (with a cached dependency layer), and `eclipse-temurin:21-jre-alpine` runs it as UID 10001. The entrypoint is `sh -c "exec java $JAVA_OPTS -jar app.jar"`, so `JAVA_OPTS` expands and the JVM is PID 1 and receives SIGTERM. The image is ~105 MB compressed.
+
+Run it locally with Postgres:
+
+```bash
+cd app
+docker compose up --build -d
+curl localhost:8080/ready
+curl -XPOST localhost:8080/api/notes -H 'content-type: application/json' -d '{"text":"hello"}'
+curl localhost:8080/api/notes
+websocat ws://localhost:8080/ws/echo          # type a line, get it echoed
+docker compose down -v
+```
+
+## Phase 2 - Infrastructure (Terraform)
+
+[`infra/main.tf`](infra/main.tf) creates:
+
+- a VPC `10.0.0.0/16`, one public subnet `10.0.1.0/24`, an internet gateway and a route table. There is only one subnet, because a private subnet is useless without a NAT gateway, and NAT gateways bill hourly.
+- a security group allowing 22 (from `var.ssh_cidr`), 80 and 443 in, and all traffic out
+- an ED25519 key generated by Terraform and written to `infra/ktor-poc.pem` with mode `0600` (git-ignored). The private key also lives in the Terraform state, which is fine for a PoC; keep the state local.
+- a `t3.micro` running Amazon Linux 2023 x86_64 (cgroup v2, which `LimitedSwap` needs): 30 GB encrypted gp3 root, IMDSv2 only, `cpu_credits = "standard"`, `ignore_changes = [ami]` (so a new AMI release never replaces the node and wipes the data)
+- a $1/month budget with email alerts
+- [`infra/user_data.sh`](infra/user_data.sh), which runs on first boot: it creates the 4 GB `/swapfile` (`fallocate`, with a `dd` fallback), `mkswap`/`swapon` and an idempotent `/etc/fstab` entry. It also sets the sysctls `vm.swappiness=30`, `vm.vfs_cache_pressure=50` and `net.ipv4.ip_unprivileged_port_start=0` (the last lets the non-root Envoy bind 80/443 on the host network), and creates `/var/lib/ktor-poc/postgres`.
+
+```bash
+cd infra
+cp terraform.tfvars.example terraform.tfvars   # set budget_email; ideally ssh_cidr = "<your-ip>/32"
+terraform init
+terraform apply
+terraform output ssh_command
+```
+
+Confirm the subscription email AWS Budgets sends, otherwise the alerts go nowhere.
+
+## Phase 3 - Cluster bootstrap
+
+```bash
+IP=$(terraform -chdir=infra output -raw public_ip)
+scp -i infra/ktor-poc.pem scripts/bootstrap-k3s.sh ec2-user@$IP:
+ssh -i infra/ktor-poc.pem ec2-user@$IP
+
+# on the node
+sudo cloud-init status --wait            # user_data finished
+swapon --show && free -m                 # 4G swap active
+bash bootstrap-k3s.sh
+```
+
+[`scripts/bootstrap-k3s.sh`](scripts/bootstrap-k3s.sh) does the following, and each step can also be run by hand:
+
+1. **Kubelet drop-in** `/var/lib/rancher/k3s/agent/etc/kubelet.conf.d/50-ktor-poc.conf` (`failSwapOn: false`, `memorySwap.swapBehavior: LimitedSwap`, `evictionHard.memory.available: 50Mi`).
+2. **k3s config** `/etc/rancher/k3s/config.yaml`: disables `traefik`, `servicelb` (Envoy Gateway replaces both), `local-storage` (we use hostPath) and `metrics-server`. Also sets `disable-network-policy` and `disable-helm-controller`, and touches `gateway-api-crd.yaml.skip`, because recent k3s releases bundle the Gateway API CRDs as a HelmChart and Envoy Gateway ships its own copy.
+3. **Install k3s**: `curl -sfL https://get.k3s.io | INSTALL_K3S_CHANNEL=stable INSTALL_K3S_SKIP_SELINUX_RPM=true sh -`
+4. **Strip control-plane taints**. A k3s server is schedulable by default, so these are no-ops, but they guarantee the single node accepts workloads on any distro:
+   ```bash
+   kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule- || true
+   kubectl taint nodes --all node-role.kubernetes.io/master:NoSchedule- || true
+   kubectl get nodes -o custom-columns=NAME:.metadata.name,TAINTS:.spec.taints   # TAINTS <none>
+   ```
+5. **Envoy Gateway v1.9.2**, which also brings Gateway API v1.6.1 CRDs: `kubectl apply --server-side -f https://github.com/envoyproxy/gateway/releases/download/v1.9.2/install.yaml`. Then the controller is shrunk from its default 256Mi request to 48Mi/256Mi.
+6. **Self-signed TLS** for the public IP (SAN `IP:<public-ip>`), stored as Secret `ktor-poc/ktor-poc-tls`.
+
+Optional `kubectl` from your laptop (port 6443 stays closed in the security group):
+
+```bash
+scp -i infra/ktor-poc.pem ec2-user@$IP:/etc/rancher/k3s/k3s.yaml ~/.kube/ktor-poc.yaml
+ssh -i infra/ktor-poc.pem -N -L 6443:127.0.0.1:6443 ec2-user@$IP &
+KUBECONFIG=~/.kube/ktor-poc.yaml kubectl get nodes
+```
+
+## Phase 4 - Deploy
+
+**Change `POSTGRES_PASSWORD`** in [`k8s/k8s-manifests.yaml`](k8s/k8s-manifests.yaml) first. Postgres only reads it when it initialises an empty data directory.
+
+```bash
+scripts/deploy.sh
+```
+
+This builds the image for `linux/amd64` (required on an Apple Silicon laptop), streams it with `docker save | ssh ... k3s ctr images import -` straight into the node's containerd (no registry), applies the manifests and restarts the Ktor rollout.
+
+What [`k8s/k8s-manifests.yaml`](k8s/k8s-manifests.yaml) contains:
+
+| Resource | Key settings |
+|---|---|
+| `Namespace ktor-poc` | |
+| `Secret postgres-credentials` | `POSTGRES_DB/USER/PASSWORD`, also mapped into the app's `DB_USER/DB_PASSWORD` |
+| `Deployment postgres` | `postgres:18-alpine`, `Recreate`, hostPath `/var/lib/ktor-poc/postgres` -> `/var/lib/postgresql` (Postgres 18 keeps PGDATA at `/var/lib/postgresql/18/docker`), 64Mi/256Mi, low-memory flags (`shared_buffers=32MB`, `max_connections=20`, ...), `pg_isready` probes |
+| `Deployment ktor` | `ktor-poc:0.1.0` with `IfNotPresent`, `Recreate` (two JVMs don't fit), tuned `JAVA_OPTS`, 128Mi/512Mi, a startup probe allowing 5 minutes (a CPU-throttled t3 boots a JVM slowly), non-root, read-only rootfs |
+| `Service postgres`, `Service ktor` | ClusterIP only |
+| `EnvoyProxy ktor-poc-proxy` | `useListenerPortAsContainerPort: true` (bind 80/443, not the shifted 10080/10443), `envoyService.type: ClusterIP` (**no LoadBalancer Service**), `Recreate`, and a strategic-merge patch adding `hostNetwork: true` + `dnsPolicy: ClusterFirstWithHostNet` |
+| `GatewayClass eg`, `Gateway ktor-gateway` | listeners `http:80` and `https:443` (terminating with `ktor-poc-tls`), attached to the EnvoyProxy via `infrastructure.parametersRef` |
+| `HTTPRoute ktor-route` | `/ws` -> ktor with `timeouts.request: 0s` (so WebSocket sessions aren't cut by a route timeout); `/` -> ktor |
+| `ClientTrafficPolicy ktor-client-timeouts` | `idleTimeout` and `streamIdleTimeout` of 1h (Envoy's default stream idle timeout is 5 min) |
+
+## Phase 5 - Verification checklist
+
+Replace `$IP` with `terraform -chdir=infra output -raw public_ip`.
+
+**Node health** (on the node)
+
+```bash
+free -m                                   # Swap total ~4095
+swapon --show                             # /swapfile 4G
+vmstat 5 5                                # si/so mostly 0 at idle; sustained high = thrashing
+cat /proc/sys/net/ipv4/ip_unprivileged_port_start   # 0
+sudo tail -20 /var/log/user-data.log
+```
+
+**Cluster health**
+
+```bash
+kubectl get nodes -o wide                 # Ready
+kubectl describe node | grep -E 'Taints|Allocatable' -A6
+kubectl get pods -A -o wide               # all Running; envoy pod IP == node IP (hostNetwork)
+kubectl get gatewayclass,gateway,httproute -A   # Accepted=True, Programmed=True
+sudo ss -ltnp | grep -E ':(80|443) '      # envoy listening on the host
+kubectl get events -A --sort-by=.lastTimestamp | grep -iE 'oom|evict|fail' || echo clean
+```
+
+**Swap is reaching pods** (`LimitedSwap`)
+
+```bash
+N=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
+kubectl get --raw "/api/v1/nodes/$N/proxy/configz" | grep -o '"memorySwap":{[^}]*}'   # LimitedSwap
+sudo find /sys/fs/cgroup -path '*kubepods*' -name memory.swap.max -exec sh -c 'printf "%s %s\n" "$(cat "$1")" "$1"' _ {} \; | grep -v '^0 ' | head
+```
+
+**Logs**
+
+```bash
+kubectl -n ktor-poc logs deploy/ktor -f          # "schema ready", request logs
+kubectl -n ktor-poc logs deploy/postgres
+kubectl -n envoy-gateway-system logs -l gateway.envoyproxy.io/owning-gateway-name=ktor-gateway -c envoy
+kubectl -n envoy-gateway-system logs deploy/envoy-gateway
+```
+
+**Functional** (from your laptop)
+
+```bash
+curl http://$IP/health
+curl -XPOST http://$IP/api/notes -H 'content-type: application/json' -d '{"text":"from the internet"}'
+curl http://$IP/api/notes
+curl -k https://$IP/ready                                  # self-signed, hence -k
+websocat ws://$IP/ws/echo                                  # type, get "echo: ..."
+websocat -k wss://$IP/ws/chat                              # run in two terminals: messages fan out
+```
+
+Leave a WebSocket idle for more than 5 minutes, then send a line. It should still answer: Ktor pings every 15s, and the policy allows 1h of stream idle time.
+
+**Persistence**
+
+```bash
+kubectl -n ktor-poc rollout restart deploy/postgres && kubectl -n ktor-poc rollout status deploy/postgres
+curl http://$IP/api/notes                                  # notes still there
+```
+
+**Zero spend**
+
+```bash
+kubectl get svc -A | grep LoadBalancer || echo "no LoadBalancer services"
+aws elbv2 describe-load-balancers --region us-east-1 --query 'LoadBalancers[].LoadBalancerName'   # []
+aws elb   describe-load-balancers --region us-east-1 --query 'LoadBalancerDescriptions[].LoadBalancerName'   # []
+aws ec2 describe-instance-credit-specifications --region us-east-1 \
+  --instance-ids $(terraform -chdir=infra output -raw instance_id)            # CpuCredits: standard
+aws ec2 describe-volumes   --region us-east-1 --query 'Volumes[].[Size,VolumeType,State]'    # one 30 gp3 in-use
+aws ec2 describe-addresses --region us-east-1 --query 'Addresses'                            # [] (no EIPs)
+aws ec2 describe-nat-gateways --region us-east-1 --query 'NatGateways[?State!=`deleted`]'    # []
+aws ec2 describe-snapshots --region us-east-1 --owner-ids self --query 'Snapshots'           # []
+```
+
+Then check **Billing and Cost Management -> Free Tier / Credits** in the console for remaining credits and the days left on the Free plan.
+
+## Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| `kubectl` hangs or is very slow | the instance is out of CPU credits (standard mode throttles to 10%). Check `CPUCreditBalance` in CloudWatch. It recovers by itself. |
+| pods `Pending` with `Insufficient memory` | the sum of requests exceeds allocatable. Check `kubectl describe node`. Don't raise requests. |
+| `OOMKilled` on ktor | lower `-Xmx`, or check `memory.swap.max` is non-zero (`LimitedSwap` only applies to Burstable pods) |
+| host doesn't listen on 80/443 | check `ip_unprivileged_port_start=0` and `useListenerPortAsContainerPort: true`. Without them, Envoy listens on 10080/10443. |
+| envoy pod stuck `Pending` after a change | the old pod still holds the host ports. The `Recreate` strategy prevents this, so delete the old pod. |
+| `ErrImageNeverPull` / `ImagePullBackOff` for `ktor-poc` | the image wasn't imported. Re-run `scripts/deploy.sh`. Check with `sudo k3s crictl images \| grep ktor`. |
+| Postgres auth fails after changing the password | Postgres keeps the password from first init. Run `sudo rm -rf /var/lib/ktor-poc/postgres/*` (**destroys data**) and restart it. |
+
+## Teardown
+
+```bash
+cd infra && terraform destroy
+```
+
+This removes the instance, its EBS volume (and with it the Postgres data), the VPC and the budget.
+
+## Deviations from the original brief
+
+- `-Xmx384m` -> `-Xmx320m` plus explicit off-heap caps, so the JVM actually fits its 512Mi limit.
+- One public subnet instead of several (a private subnet needs a NAT, which isn't free).
+- The taint removal is kept but is a no-op on k3s.
+- `cpu_credits = "standard"` and the budget alarm are additions. Without the first, a t3 in its default `unlimited` mode can bill for CPU.
