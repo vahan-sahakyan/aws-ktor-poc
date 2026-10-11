@@ -1,0 +1,74 @@
+# ==========================================
+# macOS System Files
+# ==========================================
+.DS_Store
+.AppleDouble
+.LSOverride
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.Trashes
+
+# ==========================================
+# VS Code (Visual Studio Code)
+# ==========================================
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.history/
+*.code-workspace
+
+# ==========================================
+# Kotlin / Ktor (Gradle & Maven)
+# ==========================================
+.gradle/
+build/
+!src/**/build/
+out/
+.kotlin/
+.artifacts/
+**/build/
+.gradletasknamecache
+
+# Maven (if utilizing pom templates)
+target/
+*.war
+*.ear
+
+# ==========================================
+# Kubernetes (k8s) & Containers
+# ==========================================
+kubeconfig
+.kube/
+*kubeconfig*
+*-secret.yaml
+*-secret.yml
+.skaffold/
+.docker/
+
+# ==========================================
+# Terraform
+# ==========================================
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+*.tfvars
+*.tfvars.json
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# ==========================================
+# General Secrets & Logs
+# ==========================================
+*.log
+logs/
+.env
+.env.*
+!.env.example
