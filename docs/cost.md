@@ -4,7 +4,7 @@
 
 ---
 
-The account is on the AWS Free plan (created after 2025-07-15). Free-tier usage is paid from $100-200 of credits, and the account closes after 6 months or when the credits run out. $0 means no card charges while credits last.
+The account is on the AWS Free plan (created after 2025-07-15). Usage is paid from $100-200 of credits and the plan cannot bill the card; it closes after 6 months or when credits run out, with 90 days to upgrade before AWS deletes everything. Expected burn is ~$14/month gross.
 
 | Item | Choice | Why |
 |---|---|---|
@@ -14,9 +14,10 @@ The account is on the AWS Free plan (created after 2025-07-15). Free-tier usage 
 | Ingress | Envoy on `hostNetwork` | ALB/NLB bill hourly |
 | Registry | none, `docker save` over SSH | ECR storage bills |
 | Egress | one public subnet, no NAT | NAT bills hourly |
-| Guardrail | AWS Budget: alert on actual > $0.01, forecast > $1 | free |
+| Guardrail | AWS Budget on gross cost (credits excluded), $20/month, actual + forecast alerts | net cost stays $0 on the free plan, so only gross cost shows the burn rate |
 
 Rules:
 - State the cost of any new AWS resource before adding it
 - `t3.small` (2 GB) is the only allowed upgrade; it burns credits ~2x
+- Never join AWS Organizations, Control Tower or the Partner Network: each auto-upgrades the account to paid
 - Free plan terms change; re-check them before relying on a number here
