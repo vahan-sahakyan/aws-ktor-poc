@@ -61,7 +61,14 @@ kubectl taint nodes --all node-role.kubernetes.io/master:NoSchedule- 2>/dev/null
 kubectl get nodes -o custom-columns=NAME:.metadata.name,TAINTS:.spec.taints
 
 echo "==> installing envoy gateway $EG_VERSION"
-kubectl apply --server-side -f "https://github.com/envoyproxy/gateway/releases/download/$EG_VERSION/install.yaml"
+kubectl apply --server-side --force-conflicts -f "https://github.com/envoyproxy/gateway/releases/download/$EG_VERSION/install.yaml"
+# one replica needs no leader election; on a cpu-throttled node lease renewals time out and the controller restarts
+cfg=$(mktemp)
+kubectl -n envoy-gateway-system get configmap envoy-gateway-config -o jsonpath='{.data.envoy-gateway\.yaml}' \
+  | sed '0,/^  kubernetes:$/s//  kubernetes:\n    leaderElection:\n      disable: true/' > "$cfg"
+kubectl -n envoy-gateway-system create configmap envoy-gateway-config --from-file=envoy-gateway.yaml="$cfg" \
+  --dry-run=client -o yaml | kubectl apply --server-side --force-conflicts -f -
+rm -f "$cfg"
 # default requests are 256Mi; shrink so everything schedules on ~900Mi allocatable
 kubectl -n envoy-gateway-system set resources deploy/envoy-gateway -c envoy-gateway \
   --requests=cpu=10m,memory=48Mi --limits=memory=256Mi
