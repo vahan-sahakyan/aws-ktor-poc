@@ -104,7 +104,7 @@ bash bootstrap-k3s.sh
 
 1. **Kubelet drop-in** `/var/lib/rancher/k3s/agent/etc/kubelet.conf.d/50-ktor-poc.conf` (`failSwapOn: false`, `memorySwap.swapBehavior: LimitedSwap`, `evictionHard.memory.available: 50Mi`).
 2. **k3s config** `/etc/rancher/k3s/config.yaml`: disables `traefik`, `servicelb` (Envoy Gateway replaces both), `local-storage` (we use hostPath) and `metrics-server`. Also sets `disable-network-policy` and `disable-helm-controller`, and touches `gateway-api-crd.yaml.skip`, because recent k3s releases bundle the Gateway API CRDs as a HelmChart and Envoy Gateway ships its own copy.
-3. **Install k3s**: `curl -sfL https://get.k3s.io | INSTALL_K3S_CHANNEL=stable INSTALL_K3S_SKIP_SELINUX_RPM=true sh -`
+3. **Install k3s**: `curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=v1.37.1+k3s1 INSTALL_K3S_SKIP_SELINUX_RPM=true sh -` (pinned; the channel lookup at update.k3s.io was unreachable)
 4. **Strip control-plane taints**. A k3s server is schedulable by default, so these are no-ops, but they guarantee the single node accepts workloads on any distro:
    ```bash
    kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule- || true

@@ -18,7 +18,7 @@ internet :80/:443 -> SG -> envoy (hostNetwork) -> HTTPRoute -> ktor Service :80 
 | postgres | Deployment, ClusterIP :5432 | `postgres:18-alpine` | hostPath `/var/lib/ktor-poc/postgres` |
 | envoy proxy | Deployment (managed by EG) | Envoy Gateway v1.9.2 | `hostNetwork`, Service `ClusterIP` |
 | envoy-gateway | Deployment | v1.9.2 | Gateway API v1.6.1 CRDs from its install.yaml |
-| k3s | systemd | stable channel | traefik, servicelb, local-storage, metrics-server, helm-controller off |
+| k3s | systemd | v1.37.1+k3s1 (pinned) | traefik, servicelb, local-storage, metrics-server, helm-controller off |
 
 ## Routes
 
