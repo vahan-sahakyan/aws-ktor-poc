@@ -21,51 +21,11 @@ internet
                                               hostPath /var/lib/ktor-poc/postgres)
 ```
 
-```
-app/                    Ktor service, Dockerfile, docker-compose for local runs
-infra/                  Terraform (main.tf) + user_data.sh
-scripts/bootstrap-k3s.sh  Phase 3, runs on the node
-scripts/deploy.sh         Phase 4, runs on your laptop
-k8s/k8s-manifests.yaml  everything that runs in the cluster
-```
+## Docs
 
-## Cost model (read this first)
+[Architecture](docs/architecture.md) · [Cost](docs/cost.md) · [Memory](docs/memory.md) · [Decisions](docs/decisions.md)
 
-This account is on the **AWS Free plan** (accounts created on or after 2025-07-15). That plan has no 750-hour allowance. Instead, free-tier-eligible usage is **paid from $100-200 of credits**, and the account closes after **6 months or when the credits run out**, whichever comes first, unless you upgrade. So "$0" here means **no card charges while the credits last**. It does not mean the usage is free forever.
-
-What this stack consumes, all of it free-tier eligible and paid from credits:
-
-| Item | Notes |
-|---|---|
-| 1x t3.micro, 24/7 | ~730 h/month. `cpu_credits = "standard"` is set, so the instance is **throttled, not billed**, when it runs out of CPU credits. T3 defaults to `unlimited`, which bills surplus CPU. |
-| 30 GB gp3 root volume | encrypted, deleted with the instance |
-| 1 public IPv4 | billed per hour like every public IPv4. Auto-assigned, deliberately **no Elastic IP**, because an EIP keeps billing while the instance is stopped. |
-| Data transfer out | negligible for a PoC |
-| VPC, subnet, IGW, route table, security group, key pair | free |
-| AWS Budget `ktor-poc-zero-spend` | free. Emails you on the **first cent of actual spend** after credits, and when the month's forecast exceeds $1. |
-
-Deliberately absent, because each one bills hourly: ALB/NLB (Envoy binds the host ports, and the Envoy Service is `ClusterIP`), NAT gateway, Elastic IP, ECR (the image is side-loaded over SSH), EBS snapshots, and detailed CloudWatch monitoring.
-
-## Memory budget on 1 GB
-
-| Component | Request | Limit | Measured (local 1 GiB rehearsal) |
-|---|---|---|---|
-| k3s server (apiserver, kine/sqlite, kubelet, containerd) | - | - | ~350-400 MiB |
-| envoy-gateway controller | 48Mi | 256Mi | ~85 MiB |
-| envoy proxy + shutdown-manager | 32Mi + 16Mi | 128Mi + 32Mi | ~60 MiB |
-| coredns | 70Mi | 170Mi | ~40 MiB |
-| postgres 18 | 64Mi | 256Mi | ~60 MiB |
-| ktor (JVM) | 128Mi | 512Mi | ~105 MiB |
-| **total** | ~360Mi | | **~740 MiB** |
-
-On the real instance, add ~150-200 MiB for Amazon Linux itself, which puts the total above physical RAM. The 4 GB swapfile absorbs the overflow:
-
-- **Host-level swap** (`user_data.sh`): the kernel pages cold memory from k3s and the OS out to disk.
-- **Pod-level swap** (kubelet `LimitedSwap` + Burstable pods): without this, the kubelet keeps every pod off swap (`NoSwap`). With it, each Burstable pod (requests < limits) may swap in proportion to its memory **request**: `swap = request / node RAM * swap size`. So the Ktor pod (128Mi request) can swap ~0.5 GB on top of its 512Mi RAM limit, and Postgres ~0.25 GB.
-- **JVM sizing**: `-Xmx320m` plus caps on metaspace (96m), code cache (32m), direct memory (32m) and thread stacks (512k) keep the whole process under the 512Mi limit. The brief's `-Xmx384m` would overshoot once off-heap memory is counted. `-XX:TieredStopAtLevel=1` trades peak throughput for less JIT memory and CPU. `-XX:+ExitOnOutOfMemoryError` lets Kubernetes restart a broken JVM.
-- **Eviction**: kubelet `evictionHard: memory.available<50Mi` (default 100Mi), so pods aren't evicted while swap is still absorbing pressure.
-
-If the box thrashes (constant `si`/`so` in `vmstat`), set `instance_type = "t3.small"` (2 GB). It is also on the Free plan, but burns credits about twice as fast.
+The account is on the AWS Free plan: usage is paid from credits, the plan ends after 6 months or when credits run out. Read [Cost](docs/cost.md) before changing infrastructure.
 
 ---
 
@@ -283,10 +243,3 @@ cd infra && terraform destroy
 ```
 
 This removes the instance, its EBS volume (and with it the Postgres data), the VPC and the budget.
-
-## Deviations from the original brief
-
-- `-Xmx384m` -> `-Xmx320m` plus explicit off-heap caps, so the JVM actually fits its 512Mi limit.
-- One public subnet instead of several (a private subnet needs a NAT, which isn't free).
-- The taint removal is kept but is a no-op on k3s.
-- `cpu_credits = "standard"` and the budget alarm are additions. Without the first, a t3 in its default `unlimited` mode can bill for CPU.

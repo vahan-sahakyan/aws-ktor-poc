@@ -1,5 +1,5 @@
 # single t3.micro running k3s (ktor + postgres + envoy gateway) with no load balancer.
-# every resource here is free-tier eligible or free outright; see README "Cost model".
+# every resource here is free-tier eligible or free outright; see docs/cost.md.
 
 terraform {
   required_version = ">= 1.9"
