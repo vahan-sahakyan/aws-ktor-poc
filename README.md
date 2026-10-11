@@ -79,7 +79,7 @@ docker compose down -v
 
 ```bash
 cd infra
-cp terraform.tfvars.example terraform.tfvars   # set budget_email; ideally ssh_cidr = "<your-ip>/32"
+cp terraform.tfvars.example terraform.tfvars   # set aws_account_id, budget_email; ideally ssh_cidr = "<your-ip>/32"
 terraform init
 terraform apply
 terraform output ssh_command
@@ -124,20 +124,17 @@ KUBECONFIG=~/.kube/ktor-poc.yaml kubectl get nodes
 
 ## Phase 4 - Deploy
 
-**Change `POSTGRES_PASSWORD`** in [`k8s/k8s-manifests.yaml`](k8s/k8s-manifests.yaml) first. Postgres only reads it when it initialises an empty data directory.
-
 ```bash
 scripts/deploy.sh
 ```
 
-This builds the image for `linux/amd64` (required on an Apple Silicon laptop), streams it with `docker save | ssh ... k3s ctr images import -` straight into the node's containerd (no registry), applies the manifests and restarts the Ktor rollout.
+On the first run it writes `k8s/postgres.env` (git-ignored) with a random password and creates the `postgres-credentials` Secret from it; keep that file, Postgres only reads the password when it initialises an empty data directory. It then builds the image for `linux/amd64` (required on an Apple Silicon laptop), streams it with `docker save | ssh ... k3s ctr images import -` straight into the node's containerd (no registry), applies the manifests and restarts the Ktor rollout.
 
 What [`k8s/k8s-manifests.yaml`](k8s/k8s-manifests.yaml) contains:
 
 | Resource | Key settings |
 |---|---|
 | `Namespace ktor-poc` | |
-| `Secret postgres-credentials` | `POSTGRES_DB/USER/PASSWORD`, also mapped into the app's `DB_USER/DB_PASSWORD` |
 | `Deployment postgres` | `postgres:18-alpine`, `Recreate`, hostPath `/var/lib/ktor-poc/postgres` -> `/var/lib/postgresql` (Postgres 18 keeps PGDATA at `/var/lib/postgresql/18/docker`), 64Mi/256Mi, low-memory flags (`shared_buffers=32MB`, `max_connections=20`, ...), `pg_isready` probes |
 | `Deployment ktor` | `ktor-poc:0.1.0` with `IfNotPresent`, `Recreate` (two JVMs don't fit), tuned `JAVA_OPTS`, 128Mi/512Mi, a startup probe allowing 5 minutes (a CPU-throttled t3 boots a JVM slowly), non-root, read-only rootfs |
 | `Service postgres`, `Service ktor` | ClusterIP only |

@@ -59,6 +59,11 @@ variable "swap_size_gb" {
   default     = 4
 }
 
+variable "aws_account_id" {
+  description = "The only AWS account terraform may touch (guards against the wrong credentials)"
+  type        = string
+}
+
 variable "budget_email" {
   description = "Email that receives the zero-spend budget alerts"
   type        = string
@@ -69,7 +74,8 @@ variable "budget_email" {
 # ---------------------------------------------------------------------------
 
 provider "aws" {
-  region = var.region
+  region              = var.region
+  allowed_account_ids = [var.aws_account_id]
 
   default_tags {
     tags = {
