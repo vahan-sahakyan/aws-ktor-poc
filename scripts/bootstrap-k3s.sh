@@ -3,7 +3,8 @@
 # run on the node as ec2-user: bash bootstrap-k3s.sh
 set -euo pipefail
 
-K3S_CHANNEL=${K3S_CHANNEL:-stable}
+# pinned: the channel lookup (update.k3s.io) is not reliably reachable, and pinning is reproducible
+K3S_VERSION=${K3S_VERSION:-v1.37.1+k3s1}
 EG_VERSION=${EG_VERSION:-v1.9.2}
 export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 
@@ -48,9 +49,9 @@ CONF
 sudo mkdir -p /var/lib/rancher/k3s/server/manifests
 sudo touch /var/lib/rancher/k3s/server/manifests/gateway-api-crd.yaml.skip
 
-echo "==> installing k3s ($K3S_CHANNEL)"
+echo "==> installing k3s $K3S_VERSION"
 # al2023 runs selinux permissive and has no k3s-selinux package
-curl -sfL https://get.k3s.io | INSTALL_K3S_CHANNEL="$K3S_CHANNEL" INSTALL_K3S_SKIP_SELINUX_RPM=true sh -
+curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="$K3S_VERSION" INSTALL_K3S_SKIP_SELINUX_RPM=true sh -
 for _ in $(seq 1 100); do kubectl get nodes >/dev/null 2>&1 && break; sleep 3; done
 kubectl wait node --all --for=condition=Ready --timeout=300s
 
@@ -60,7 +61,14 @@ kubectl taint nodes --all node-role.kubernetes.io/master:NoSchedule- 2>/dev/null
 kubectl get nodes -o custom-columns=NAME:.metadata.name,TAINTS:.spec.taints
 
 echo "==> installing envoy gateway $EG_VERSION"
-kubectl apply --server-side -f "https://github.com/envoyproxy/gateway/releases/download/$EG_VERSION/install.yaml"
+kubectl apply --server-side --force-conflicts -f "https://github.com/envoyproxy/gateway/releases/download/$EG_VERSION/install.yaml"
+# one replica needs no leader election; on a cpu-throttled node lease renewals time out and the controller restarts
+cfg=$(mktemp)
+kubectl -n envoy-gateway-system get configmap envoy-gateway-config -o jsonpath='{.data.envoy-gateway\.yaml}' \
+  | sed '0,/^  kubernetes:$/s//  kubernetes:\n    leaderElection:\n      disable: true/' > "$cfg"
+kubectl -n envoy-gateway-system create configmap envoy-gateway-config --from-file=envoy-gateway.yaml="$cfg" \
+  --dry-run=client -o yaml | kubectl apply --server-side --force-conflicts -f -
+rm -f "$cfg"
 # default requests are 256Mi; shrink so everything schedules on ~900Mi allocatable
 kubectl -n envoy-gateway-system set resources deploy/envoy-gateway -c envoy-gateway \
   --requests=cpu=10m,memory=48Mi --limits=memory=256Mi

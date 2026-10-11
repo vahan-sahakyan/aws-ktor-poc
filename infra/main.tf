@@ -59,6 +59,11 @@ variable "swap_size_gb" {
   default     = 4
 }
 
+variable "aws_account_id" {
+  description = "The only AWS account terraform may touch (guards against the wrong credentials)"
+  type        = string
+}
+
 variable "budget_email" {
   description = "Email that receives the zero-spend budget alerts"
   type        = string
@@ -69,7 +74,8 @@ variable "budget_email" {
 # ---------------------------------------------------------------------------
 
 provider "aws" {
-  region = var.region
+  region              = var.region
+  allowed_account_ids = [var.aws_account_id]
 
   default_tags {
     tags = {
@@ -241,22 +247,27 @@ resource "aws_instance" "node" {
 }
 
 # ---------------------------------------------------------------------------
-# zero-spend guardrail (budgets are free)
+# credit burn guardrail: gross cost (credits excluded), since on the free plan
+# net cost stays $0 until credits run out and the account closes
 # ---------------------------------------------------------------------------
 
-resource "aws_budgets_budget" "zero_spend" {
-  name         = "${var.project}-zero-spend"
+resource "aws_budgets_budget" "credit_burn" {
+  name         = "${var.project}-credit-burn"
   budget_type  = "COST"
-  limit_amount = "1.0"
+  limit_amount = "20.0"
   limit_unit   = "USD"
   time_unit    = "MONTHLY"
 
-  # alert on the first real cent, i.e. anything the free plan credits did not absorb
+  cost_types {
+    include_credit = false
+  }
+
+  # expected burn is ~$14/month; either alert means something unplanned is running
   notification {
     comparison_operator        = "GREATER_THAN"
     notification_type          = "ACTUAL"
-    threshold                  = 0.01
-    threshold_type             = "ABSOLUTE_VALUE"
+    threshold                  = 100
+    threshold_type             = "PERCENTAGE"
     subscriber_email_addresses = [var.budget_email]
   }
 

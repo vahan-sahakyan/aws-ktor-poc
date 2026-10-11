@@ -16,6 +16,8 @@ OS + k3s + Envoy Gateway + Postgres + JVM exceed 1 GB of RAM. A 4 GB swapfile an
 | coredns | 70Mi / 170Mi | ~40 MiB |
 | total | ~360Mi | ~740 MiB, + ~150-200 MiB for AL2023 |
 
+On the real t3.micro (913 MiB usable) right after deploy: ~610 MiB RAM used + ~830 MiB in swap, k3s-server RSS ~390 MB, no OOM kills or evictions. Pod swap caps from `LimitedSwap`: ktor ~574 MiB, postgres ~287 MiB.
+
 ## Swap
 
 - Host: `/swapfile` 4 GB from `user_data.sh`, `vm.swappiness=30`
@@ -29,6 +31,8 @@ OS + k3s + Envoy Gateway + Postgres + JVM exceed 1 GB of RAM. A 4 GB swapfile an
 Heap plus off-heap caps stay under 512Mi; C1-only JIT trades peak throughput for less memory and CPU.
 
 ## Signs of trouble
+
+- A fresh t3.micro has 0 CPU credits: expect ~60% steal and load 4-6 for the first minutes (bootstrap 100s, deploy 175s, gateway ready ~3 min later)
 
 - `vmstat 5`: sustained `si`/`so` = thrashing -> `instance_type = "t3.small"`
 - `kubectl get events -A | grep -iE 'oom|evict'`

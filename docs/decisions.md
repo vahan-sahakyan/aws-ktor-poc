@@ -10,6 +10,7 @@
 | Envoy Service `ClusterIP` | a `LoadBalancer` Service is what provisions cloud LBs |
 | `Recreate` for envoy, ktor, postgres | host ports can't be shared; two JVMs don't fit; one hostPath writer |
 | Envoy Gateway requests shrunk (controller 48Mi, proxy 32Mi) | defaults (256Mi + 512Mi) don't schedule on ~900Mi allocatable |
+| Envoy Gateway leader election off | one replica; on a CPU-throttled node lease renewals time out and the controller restarts |
 | `gateway-api-crd.yaml.skip` | k3s v1.37 bundles Gateway API CRDs as a HelmChart, which loops on errors with the helm controller off; Envoy Gateway's pinned CRDs stay the only copy |
 | hostPath at `/var/lib/postgresql` | Postgres 18 keeps PGDATA at `/var/lib/postgresql/18/docker` |
 | `-Xmx320m` + off-heap caps | `-Xmx384m` overshoots a 512Mi limit once off-heap counts |

@@ -15,6 +15,18 @@ docker build --platform linux/amd64 -t "$IMAGE" app
 echo "==> importing $IMAGE into k3s containerd on $IP"
 docker save "$IMAGE" | gzip | "${SSH[@]}" 'gunzip | sudo k3s ctr -n k8s.io images import -'
 
+# credentials live only in a git-ignored env file; postgres keeps the first password it initialises with
+ENV_FILE=k8s/postgres.env
+if [ ! -f "$ENV_FILE" ]; then
+  echo "==> generating $ENV_FILE"
+  umask 077
+  printf 'POSTGRES_DB=ktor\nPOSTGRES_USER=ktor\nPOSTGRES_PASSWORD=%s\n' "$(openssl rand -hex 24)" > "$ENV_FILE"
+fi
+
+echo "==> creating postgres-credentials secret"
+"${SSH[@]}" 'kubectl create namespace ktor-poc --dry-run=client -o yaml | kubectl apply -f - >/dev/null &&
+  kubectl -n ktor-poc create secret generic postgres-credentials --from-env-file=/dev/stdin --dry-run=client -o yaml | kubectl apply -f -' < "$ENV_FILE"
+
 echo "==> applying manifests"
 "${SSH[@]}" 'kubectl apply -f -' < k8s/k8s-manifests.yaml
 
